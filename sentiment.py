@@ -1,83 +1,83 @@
-import nltk
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import re
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from textblob import TextBlob  # Adding ensemble method
-import emoji
+import unicodedata
 
-nltk.download('vader_lexicon', quiet=True)
-nltk.download('punkt', quiet=True)
-
-# Enhanced preprocessing patterns
-URL_PATTERN = re.compile(r'https?\S+|www\.\S+')
-HASHTAG_PATTERN = re.compile(r'#\w+')
-SPECIAL_CHARS = re.compile(r'[^\w\s!?.,]')
-REPEAT_CHARS = re.compile(r'(.)\1{2,}')
-
-# Initialize analyzers
-vader = SentimentIntensityAnalyzer()
-
-# Expanded custom lexicon
-LEXICON_UPDATES = {
-    **{e: 4.0 for e in ['🔥', '❤️', '👍', '🎉']},
-    **{e: -4.0 for e in ['💩', '👎', '😡', '🤮']},
-    'epic': 3.5,
-    'sucks': -3.0,
-    'rofl': 2.7,
-    'meh': -1.8,
-    'banger': 3.2,
-    'cringe': -2.5,
-    'based': 2.0,
-    'mid': -0.5,
-    'woke': -1.0  # Context-dependent
-}
-vader.lexicon.update(LEXICON_UPDATES)
-
-def preprocess(text):
-    """Advanced text preprocessing"""
-    text = emoji.demojize(text)  # Convert emojis to text
-    text = URL_PATTERN.sub('', text)
-    text = HASHTAG_PATTERN.sub('', text)
-    text = SPECIAL_CHARS.sub('', text)
-    text = REPEAT_CHARS.sub(r'\1', text)  # Reduce repeated chars
-    text = text.lower().strip()
+def clean_text(text):
+    """
+    Clean the text by removing URLs, emojis, special characters, and extra whitespace
+    Ensures pure text-based analysis
+    """
+    # Remove URLs
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    
+    # Remove emojis and special characters
+    text = ''.join(c for c in text if not unicodedata.category(c).startswith('So'))
+    
+    # Remove all non-alphanumeric characters except spaces
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Convert to lowercase for consistency
+    text = text.lower()
+    
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    
     return text
 
+def calculate_confidence(scores, compound_score):
+    """
+    Calculate confidence score based on VADER scores
+    Returns a percentage between 0-100
+    """
+    # Get the dominant score (positive, negative, or neutral)
+    max_score = max(scores["pos"], scores["neg"], scores["neu"])
+    
+    # Calculate base confidence from the strength of the compound score
+    compound_confidence = abs(compound_score) * 100
+    
+    # Calculate score distribution confidence
+    score_confidence = max_score * 100
+    
+    # Weighted average of both confidence measures
+    final_confidence = (compound_confidence * 0.7 + score_confidence * 0.3)
+    
+    # Cap at 100 and round to 2 decimal places
+    return min(round(final_confidence, 2), 100)
+
 def analyze_sentiment(text):
-    """Ensemble method combining VADER and TextBlob"""
-    processed = preprocess(text)
+    """
+    Analyze the sentiment of text using VADER sentiment analyzer.
+    Pure text-based analysis without emoji consideration.
+    """
+    analyzer = SentimentIntensityAnalyzer()
     
-    # VADER analysis
-    vader_scores = vader.polarity_scores(processed)
+    # Clean the text thoroughly
+    cleaned_text = clean_text(text)
     
-    # TextBlob analysis
-    blob = TextBlob(processed)
-    tb_polarity = blob.sentiment.polarity
-    tb_subjectivity = blob.sentiment.subjectivity
+    # Get sentiment scores from pure text
+    scores = analyzer.polarity_scores(cleaned_text)
     
-    # Combined score
-    combined = (vader_scores['compound'] * 0.7) + (tb_polarity * 0.3)
+    # Determine sentiment category with adjusted thresholds
+    compound_score = scores['compound']
     
-    # Sentiment determination
-    thresholds = {
-        'positive': 0.15,
-        'negative': -0.15,
-        'neutral_low': -0.05,
-        'neutral_high': 0.05
-    }
-    
-    if combined > thresholds['positive']:
-        sentiment = 'positive'
-    elif combined < thresholds['negative']:
-        sentiment = 'negative'
-    elif thresholds['neutral_low'] <= combined <= thresholds['neutral_high']:
-        sentiment = 'neutral'
+    if compound_score >= 0.05:
+        sentiment = "positive"
+    elif compound_score <= -0.05:
+        sentiment = "negative"
     else:
-        sentiment = 'mixed'
+        sentiment = "neutral"
+    
+    # Calculate confidence score
+    confidence = calculate_confidence(scores, compound_score)
     
     return {
-        'sentiment': sentiment,
-        'confidence': abs(combined),
-        'vader': vader_scores,
-        'textblob': {'polarity': tb_polarity, 'subjectivity': tb_subjectivity},
-        'processed_text': processed
+        "text": cleaned_text,
+        "sentiment": sentiment,
+        "confidence": confidence,
+        "scores": {
+            "positive": scores["pos"],
+            "negative": scores["neg"],
+            "neutral": scores["neu"],
+            "compound": scores["compound"]
+        }
     }
