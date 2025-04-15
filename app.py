@@ -1,7 +1,9 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from youtube_api import fetch_comments, get_video_details
 from sentiment import analyze_sentiment
-from flask_cors import CORS  # Import Flask-CORS
+from config import MAX_COMMENTS
+from collections import defaultdict
 import logging
 
 # Configure logging
@@ -9,72 +11,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 @app.route("/api/comments", methods=["GET"])
 def get_comments():
-    video_id = request.args.get("videoId")
-    logger.info(f"Received request for video ID: {video_id}")
-    
-    if not video_id:
-        logger.error("No video ID provided")
-        return jsonify({"error": "Parameter 'videoId' is required."}), 400
-
     try:
-        max_results = int(request.args.get("maxResults", 1000))
-    except ValueError:
-        max_results = 1000
-
-    try:
-        # Get video details first
-        logger.info(f"Fetching video details for {video_id}")
+        video_id = request.args.get("videoId")
+        if not video_id or len(video_id) != 11:
+            return jsonify({"error": "Valid videoId (11 chars) is required"}), 400
+        
+        # Get video details
         video_details = get_video_details(video_id)
         if not video_details:
-            logger.error(f"Could not fetch video details for {video_id}")
-            return jsonify({"error": "Could not fetch video details."}), 404
-
-        # Fetch and process comments
-        logger.info(f"Fetching comments for {video_id}")
-        comments = fetch_comments(video_id, max_results)
+            return jsonify({"error": "Video not found"}), 404
+        
+        # Fetch comments
+        comments = fetch_comments(video_id)
         if not comments:
-            logger.error(f"No comments found for {video_id}")
-            return jsonify({"error": "No comments found for this video."}), 404
-
+            return jsonify({"error": "No comments found"}), 404
+        
+        # Analyze sentiments
         processed_comments = []
-        sentiment_stats = {
-            "positive": 0,
-            "negative": 0,
-            "neutral": 0
-        }
-
-        logger.info(f"Processing {len(comments)} comments")
+        stats = defaultdict(int)
+        
         for comment in comments:
-            sentiment_result = analyze_sentiment(comment["text"])
-            sentiment_stats[sentiment_result["sentiment"]] += 1
-            
-            processed_comment = {
-                "text": comment["text"],
-                "likeCount": comment["likeCount"],
-                "publishedAt": comment["publishedAt"],
-                "sentiment": sentiment_result["sentiment"],
-                "scores": sentiment_result["scores"]
-            }
-            processed_comments.append(processed_comment)
+            analysis = analyze_sentiment(comment["text"])
+            processed_comments.append({
+                **comment,
+                "sentiment": analysis["sentiment"],
+                "confidence": analysis["confidence"],
+                "source": analysis["source"]
+            })
+            stats[analysis["sentiment"]] += 1
 
-        response_data = {
+        return jsonify({
             "videoId": video_id,
             "videoTitle": video_details["title"],
-            "videoPublishedAt": video_details["publishedAt"],
+            "channelTitle": video_details["channelTitle"],
             "comments": processed_comments,
-            "sentimentStats": sentiment_stats
-        }
-        
-        logger.info(f"Successfully processed video {video_id} with {len(processed_comments)} comments")
-        return jsonify(response_data)
+            "statistics": dict(stats),
+            "count": len(processed_comments)
+        })
 
     except Exception as e:
-        logger.error(f"Error processing request for {video_id}: {str(e)}")
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+        logger.error(f"API Error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000)
