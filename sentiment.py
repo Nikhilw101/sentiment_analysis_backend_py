@@ -4,16 +4,23 @@ import logging
 import json
 from functools import lru_cache
 import emoji
+# Load external data files with proper encoding
+try:
+    with open("emoji_data.json", encoding='utf-8') as f:
+        EMOJI_MAP = json.load(f)
+    
+    with open("hinglish_lexicon.json", encoding='utf-8') as f:
+        LEXICON = json.load(f)
+    
+    with open("neutral_lexicon.json", encoding='utf-8') as f:
+        NEUTRAL_TERMS = json.load(f)
 
-# Load external data files
-with open("emoji_data.json") as f:
-    EMOJI_MAP = json.load(f)
-
-with open("hinglish_lexicon.json") as f:
-    LEXICON = json.load(f)
-
-with open("neutral_lexicon.json") as f:
-    NEUTRAL_TERMS = json.load(f)
+except FileNotFoundError as e:
+    logging.error(f"Missing required file: {str(e)}")
+    raise
+except json.JSONDecodeError as e:
+    logging.error(f"Invalid JSON format: {str(e)}")
+    raise
 
 # Initialize mBERT with custom config
 mbert_analyzer = pipeline(
