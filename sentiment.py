@@ -1,83 +1,154 @@
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from transformers import pipeline
 import re
-import unicodedata
+import logging
+import json
+from functools import lru_cache
+import emoji
 
-def clean_text(text):
-    """
-    Clean the text by removing URLs, emojis, special characters, and extra whitespace
-    Ensures pure text-based analysis
-    """
-    # Remove URLs
-    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    
-    # Remove emojis and special characters
-    text = ''.join(c for c in text if not unicodedata.category(c).startswith('So'))
-    
-    # Remove all non-alphanumeric characters except spaces
-    text = re.sub(r'[^\w\s]', '', text)
-    
-    # Convert to lowercase for consistency
-    text = text.lower()
-    
-    # Remove extra whitespace
-    text = ' '.join(text.split())
-    
-    return text
+# Load external data files
+with open("emoji_data.json") as f:
+    EMOJI_MAP = json.load(f)
 
-def calculate_confidence(scores, compound_score):
-    """
-    Calculate confidence score based on VADER scores
-    Returns a percentage between 0-100
-    """
-    # Get the dominant score (positive, negative, or neutral)
-    max_score = max(scores["pos"], scores["neg"], scores["neu"])
-    
-    # Calculate base confidence from the strength of the compound score
-    compound_confidence = abs(compound_score) * 100
-    
-    # Calculate score distribution confidence
-    score_confidence = max_score * 100
-    
-    # Weighted average of both confidence measures
-    final_confidence = (compound_confidence * 0.7 + score_confidence * 0.3)
-    
-    # Cap at 100 and round to 2 decimal places
-    return min(round(final_confidence, 2), 100)
+with open("hinglish_lexicon.json") as f:
+    LEXICON = json.load(f)
 
-def analyze_sentiment(text):
-    """
-    Analyze the sentiment of text using VADER sentiment analyzer.
-    Pure text-based analysis without emoji consideration.
-    """
-    analyzer = SentimentIntensityAnalyzer()
+with open("neutral_lexicon.json") as f:
+    NEUTRAL_TERMS = json.load(f)
+
+# Initialize mBERT with custom config
+mbert_analyzer = pipeline(
+    "text-classification",
+    model="nlptown/bert-base-multilingual-uncased-sentiment",
+    device="cpu",
+    return_all_scores=True
+)
+
+def detect_language(text):
+    """Enhanced language detection with mixed script support"""
+    devanagari = re.search(r'[\u0900-\u097F]', text)
+    latin = re.search(r'[a-zA-Z]', text)
+    numeric = re.search(r'\d', text)
     
-    # Clean the text thoroughly
-    cleaned_text = clean_text(text)
+    # Code-mixing detection
+    if devanagari and latin:
+        return "hinglish"
+    if devanagari:
+        return "hindi"
+    if latin:
+        if numeric and len(text) < 20:  # Handle short numeric/text mixes
+            return "mixed"
+        return "english"
+    return "unknown"
+
+def preprocess_text(text):
+    """Advanced text normalization"""
+    # Convert emojis to text and preserve
+    text = emoji.demojize(text, delimiters=(" [", "] "))
     
-    # Get sentiment scores from pure text
-    scores = analyzer.polarity_scores(cleaned_text)
+    # Remove URLs but preserve domain mentions
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
     
-    # Determine sentiment category with adjusted thresholds
-    compound_score = scores['compound']
+    # Normalize repeated characters with context awareness
+    text = re.sub(r'(.)\1{3,}', r'\1\1', text)  # Allow 2 repeats max
     
-    if compound_score >= 0.05:
-        sentiment = "positive"
-    elif compound_score <= -0.05:
-        sentiment = "negative"
-    else:
-        sentiment = "neutral"
+    # Handle mixed script normalization
+    text = re.sub(r'[॰ॐ।]+', ' ', text)  # Hindi punctuation
+    return text.strip()
+
+def adjust_scores(text, scores):
+    """Balanced score adjustment with enhanced neutral support"""
+    lang = detect_language(text)
+    text_lower = text.lower()
     
-    # Calculate confidence score
-    confidence = calculate_confidence(scores, compound_score)
+    # Emoji sentiment balancing
+    emoji_counts = {"positive": 0, "negative": 0, "neutral": 0}
+    for emj, sentiment in EMOJI_MAP.items():
+        count = text.count(emj)
+        if count > 0:
+            scores[sentiment] *= 1 + (0.15 * count)
+            emoji_counts[sentiment] += count
     
-    return {
-        "text": cleaned_text,
-        "sentiment": sentiment,
-        "confidence": confidence,
-        "scores": {
-            "positive": scores["pos"],
-            "negative": scores["neg"],
-            "neutral": scores["neu"],
-            "compound": scores["compound"]
-        }
+    # Neutral emoji compensation
+    if emoji_counts["neutral"] > 0:
+        scores["neutral"] *= 1 + (0.1 * emoji_counts["neutral"])
+    
+    # Lexicon adjustments with intensity scaling
+    neutral_boost = sum(1 for term in NEUTRAL_TERMS 
+                     if re.search(r'\b' + re.escape(term) + r'\b', text_lower))
+    scores["neutral"] *= 1 + (0.25 * neutral_boost)
+    
+    # Reduced positive/negative boosts
+    boost_factors = {
+        "positive": 1 + (0.12 * sum(1 for w in LEXICON["positive"] 
+                                  if re.search(r'\b' + re.escape(w) + r'\b', text_lower))),
+        "negative": 1 + (0.12 * sum(1 for w in LEXICON["negative"] 
+                                  if re.search(r'\b' + re.escape(w) + r'\b', text_lower)))
     }
+    
+    # Apply boosts
+    scores = {
+        "positive": scores["positive"] * boost_factors["positive"],
+        "negative": scores["negative"] * boost_factors["negative"],
+        "neutral": scores["neutral"]
+    }
+    
+    # Enhanced normalization
+    total = sum(scores.values())
+    min_score = min(scores.values())
+    return {k: (v + min_score/2) / (total + min_score/2) for k, v in scores.items()}
+
+@lru_cache(maxsize=1000)
+def analyze_sentiment(text):
+    """Precision-focused sentiment analysis with neutral boost"""
+    try:
+        cleaned_text = preprocess_text(text[:512])
+        
+        # Get raw scores from model
+        raw_result = mbert_analyzer(cleaned_text)[0]
+        star_ratings = {label['label']: label['score'] for label in raw_result}
+        
+        # Enhanced sentiment mapping
+        sentiment_map = {
+            "1 star": {"sentiment": "negative", "weight": 1.1},
+            "2 stars": {"sentiment": "negative", "weight": 0.7},
+            "3 stars": {"sentiment": "neutral", "weight": 1.4},
+            "4 stars": {"sentiment": "positive", "weight": 0.7},
+            "5 stars": {"sentiment": "positive", "weight": 1.1}
+        }
+        
+        # Calculate weighted scores
+        scores = {"positive": 0.0, "negative": 0.0, "neutral": 0.0}
+        for label, data in sentiment_map.items():
+            scores[data["sentiment"]] += star_ratings[label] * data["weight"]
+        
+        # Apply contextual adjustments
+        scores = adjust_scores(cleaned_text, scores)
+        
+        # Confidence calculation with neutral priority
+        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
+        primary_score = sorted_scores[0][1]
+        secondary_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0
+        
+        confidence = int(((primary_score - secondary_score) * 125) + 25)
+        confidence = max(1, min(100, confidence))
+        
+        return {
+            "sentiment": sorted_scores[0][0],
+            "confidence": confidence,
+            "language": detect_language(cleaned_text),
+            "breakdown": {
+                "raw_scores": {k: round(v, 4) for k, v in scores.items()},
+                "dominant_class": sorted_scores[0][0],
+                "secondary_class": sorted_scores[1][0] if len(sorted_scores) > 1 else None
+            },
+            "source": "enhanced-mbert"
+        }
+        
+    except Exception as e:
+        logging.error(f"Analysis error: {str(e)}", exc_info=True)
+        return {
+            "sentiment": "neutral",
+            "confidence": 1,
+            "language": "unknown",
+            "source": "error"
+        }
